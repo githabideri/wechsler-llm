@@ -1,31 +1,30 @@
 # llama-cpp Slot Persistence
 
-Persistent KV cache slots for the llama-cpp container.
+Persistent KV cache slots for llama.cpp server.
 
 ## Status
 **WORKING** (verified 2026-02-10)
 
-## Service
+## How It Works
 
-**Location:** `/etc/systemd/system/llama-server.service`
+llama-cpp server supports multiple parallel "slots" — independent context windows.
+Each slot's KV cache can be saved to disk and restored later, surviving restarts and backend switches.
 
-```ini
-[Service]
-Type=simple
-WorkingDirectory=/opt/llama.cpp
-ExecStart=/opt/llama.cpp/build/bin/llama-server \
-  --model /mnt/models/gguf/nemotron-3-nano-30b-a3b/Nemotron-3-Nano-30B-A3B-IQ4_NL.gguf \
-  --host 0.0.0.0 \
-  --port 8080 \
-  --ctx-size 32768 \
-  --parallel 4 \
-  --slot-save-path /var/lib/llama-cpp/slots \
-  --reasoning-format none
-Restart=on-failure
-RestartSec=5
-StandardOutput=append:/var/log/llama-server.log
-StandardError=append:/var/log/llama-server.log
+In-memory, llama-cpp also auto-matches incoming prompts to existing slots via `--slot-prompt-similarity` (default 0.10 = 90% prefix match reuses cached KV).
+
+## Service Config
+
+Key flags for the llama-server systemd unit:
+
 ```
+--slot-save-path /mnt/models/cache/llama-cpp/slots   # enables save/restore API
+--parallel 1                                           # number of slots (1 = full context per slot)
+--ctx-size 196608                                      # total context across all slots
+--reasoning-format none                                # strip thinking tokens
+```
+
+With `--parallel 1`, the single slot gets the full context window.
+With `--parallel N`, context is split evenly (196k/N per slot).
 
 ## Slot Save/Restore API
 
@@ -34,38 +33,39 @@ StandardError=append:/var/log/llama-server.log
 curl http://localhost:8080/slots
 ```
 
-**Save slot:**
+**Save slot to disk:**
 ```bash
 curl -X POST "http://localhost:8080/slots/0?action=save" \
   -H "Content-Type: application/json" \
-  -d '{"filename": "agent-context-0"}'
+  -d '{"filename": "localbot-main"}'
 ```
 
-**Restore slot:**
+**Restore slot from disk:**
 ```bash
 curl -X POST "http://localhost:8080/slots/0?action=restore" \
   -H "Content-Type: application/json" \
-  -d '{"filename": "agent-context-0"}'
+  -d '{"filename": "localbot-main"}'
 ```
-
-Slots are saved to `/var/lib/llama-cpp/slots/`.
 
 ## Test Results
 
-- **Prompt processing:** ~50 tok/s
-- **Generation:** ~42 tok/s
-- **Save:** <1ms
+- **Prompt processing:** ~153 tok/s
+- **Generation:** ~98 tok/s
+- **Save (33 tokens):** 34ms, 48MB file
 - **Restore:** <1ms
+
+File size scales with token count and model's KV dimensions.
 
 ## Health Check
 
 ```bash
-ssh llama-cpp 'curl -s http://localhost:8080/health'
+curl -s http://localhost:8080/health
 # Returns {"status":"ok"}
 ```
 
-## Notes
+## Architecture Notes
 
-- Context reduced to 32k (from 131k) due to GPU memory constraints when vLLM is also running
-- Model auto-fits to available GPU memory (no fixed `--n-gpu-layers`)
-- 4 parallel slots available for concurrent requests
+- Only one GPU-heavy backend should run at a time (llama-cpp OR vLLM)
+- Before switching backends: save active slots → stop → start other backend
+- After switching back: restore saved slots
+- Slot files persist on shared storage alongside model files

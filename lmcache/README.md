@@ -1,13 +1,20 @@
 # LMCache Setup (vLLM)
 
-Persistent KV cache for the vLLM container.
+Persistent KV cache for vLLM using [LMCache](https://github.com/LMCache/LMCache).
 
 ## Status
 **WORKING** (verified 2026-02-10)
 
+## How It Works
+
+LMCache intercepts vLLM's KV cache and persists it to CPU RAM and/or disk.
+Repeated prompt prefixes skip GPU recomputation entirely.
+
+**Cache tiers:** GPU → CPU RAM → Disk (LRU eviction)
+
 ## Config
 
-**Location:** `/etc/lmcache.yaml`
+`/etc/lmcache.yaml` on the vLLM host:
 
 ```yaml
 chunk_size: 256
@@ -20,41 +27,34 @@ use_layerwise: false
 save_decode_cache: false
 ```
 
-## vLLM Service
+## vLLM Integration
 
-**Location:** `/etc/systemd/system/vllm.service`
-
-```ini
-[Service]
-User=vllmuser
-Environment=VLLM_USE_V1=1
+Add to vLLM service environment:
+```
 Environment=LMCACHE_CONFIG_FILE=/etc/lmcache.yaml
-ExecStart=/home/vllmuser/.venv/bin/vllm serve cyankiwi/Qwen3-VL-4B-Instruct-AWQ-4bit \
-  --host 0.0.0.0 --port 8000 \
-  --max-model-len 12288 \
-  --gpu-memory-utilization 0.9 \
-  --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}'
+```
+
+Add to vLLM command line:
+```
+--kv-transfer-config '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}'
 ```
 
 ## Test Results
 
-Same prompt twice:
+Same prompt sent twice:
 - **Cold:** 3.24s
-- **Warm (cached):** 0.08s
+- **Warm (cached):** 0.08s (~40x speedup)
 
 ## Health Check
 
 ```bash
-ssh vllm 'curl -s http://localhost:8000/v1/models'
+curl -s http://localhost:8000/v1/models
 # Returns 200 when ready
 ```
 
-Note: `/health` endpoint doesn't respond in this vLLM build.
+Note: `/health` endpoint may not respond in all vLLM builds; use `/v1/models` instead.
 
 ## Troubleshooting
 
-**GPU memory stuck:** If vLLM fails with "not enough GPU memory" but nvidia-smi shows no processes, the GPU state is stale. Either:
-- Kill all vllm processes and restart
-- Reboot the GPU host if persists
-
-**max_model_len too high:** Lower it if KV cache allocation fails.
+- **GPU memory stuck (no processes but VRAM used):** Kill all vllm processes and restart, or reboot the GPU host
+- **max_model_len too high:** Lower it if KV cache allocation fails — error will say how much is available
