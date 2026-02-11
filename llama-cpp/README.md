@@ -20,8 +20,10 @@ Key flags for the llama-server systemd unit:
 --slot-save-path /mnt/models/cache/llama-cpp/slots   # enables save/restore API
 --parallel 1                                           # number of slots (1 = full context per slot)
 --ctx-size 196608                                      # total context across all slots
---reasoning-format none                                # strip thinking tokens
+--reasoning-format deepseek                            # extract <think> into reasoning_content
 ```
+
+**Reasoning format:** Models that use `<think>...</think>` tags (Nemotron, Qwen3, DeepSeek) need `--reasoning-format deepseek` to separate thinking from visible output. The server extracts thinking into `reasoning_content` and keeps clean output in `content`. Using `none` leaves thinking mixed into the response or strips it, breaking CoT.
 
 With `--parallel 1`, the single slot gets the full context window.
 With `--parallel N`, context is split evenly (196k/N per slot).
