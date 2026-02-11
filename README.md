@@ -22,16 +22,22 @@ This repo keeps the operational truth in one place so upgrades are safe, changes
 - **No secrets** stored here (use env or secrets manager)
 - **Composable** — each piece can be used independently
 
-## Core Concept: Clean Backend Switching
+## Core Concept: Layered Inference
 
-Only one GPU-heavy backend runs at a time. Switching is:
+Two tiers of compute, managed as one:
 
-1. **Save** active KV cache state (slots for llama-cpp, automatic for LMCache)
-2. **Stop** current backend
-3. **Start** new backend
-4. **Restore** cached state
+### Always-On (CPU)
+- **llama-local** — Nemotron-3-Nano-30B on CPU (i5-8400T, ~10 tok/s, 196K ctx)
+- Slot persistence for instant startup (10ms restore)
+- Handles easy tasks, routing, async work, fallback
 
-This ensures each backend gets full GPU resources and cache state survives switches.
+### On-Demand (GPU)
+- Only one GPU-heavy backend runs at a time. Switching is:
+  1. **Save** active KV cache state (slots for llama-cpp, automatic for LMCache)
+  2. **Stop** current backend
+  3. **Start** new backend
+  4. **Restore** cached state
+- Full GPU resources per backend, cache state survives switches
 
 ## Structure
 

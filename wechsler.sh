@@ -24,12 +24,16 @@ LLAMA_HOST="${LLAMA_HOST:-llama-cpp}"
 LLAMA_PORT="${LLAMA_PORT:-8080}"
 VLLM_HOST="${VLLM_HOST:-vllm}"
 VLLM_PORT="${VLLM_PORT:-8000}"
+LOCAL_HOST="${LOCAL_HOST:-llama-local}"
+LOCAL_PORT="${LOCAL_PORT:-8080}"
 SLOT_NAME="${SLOT_NAME:-localbot}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-120}"
 SLOT_PATH="${SLOT_PATH:-/mnt/models/cache/llama-cpp/slots}"
+LOCAL_SLOT_PATH="${LOCAL_SLOT_PATH:-/models/cache/slots}"
 
 LLAMA_URL="http://localhost:${LLAMA_PORT}"
 VLLM_URL="http://localhost:${VLLM_PORT}"
+LOCAL_URL="http://localhost:${LOCAL_PORT}"
 
 log() { echo "[wechsler] $*"; }
 err() { echo "[wechsler] ERROR: $*" >&2; }
@@ -89,6 +93,43 @@ restore_slot() {
     log "Restored: ${result}"
 }
 
+# Check if llama-local is reachable and healthy
+check_local_server() {
+    ssh -o ConnectTimeout=3 -o BatchMode=yes "$LOCAL_HOST" "true" >/dev/null 2>&1
+}
+
+check_local_health() {
+    check_health "$LOCAL_HOST" "$LOCAL_URL" "/health"
+}
+
+# Save llama-local slot to disk
+save_local_slot() {
+    local name="${1:-localbot-cpu}"
+    log "Saving local slot 0 as '${name}'..."
+    local result
+    result=$(ssh "$LOCAL_HOST" "curl -sf -X POST '${LOCAL_URL}/slots/0?action=save' \
+        -H 'Content-Type: application/json' \
+        -d '{\"filename\": \"${name}\"}'") || {
+        err "Failed to save local slot"
+        return 1
+    }
+    log "Saved: ${result}"
+}
+
+# Restore llama-local slot from disk
+restore_local_slot() {
+    local name="${1:-localbot-cpu}"
+    log "Restoring local slot 0 from '${name}'..."
+    local result
+    result=$(ssh "$LOCAL_HOST" "curl -sf -X POST '${LOCAL_URL}/slots/0?action=restore' \
+        -H 'Content-Type: application/json' \
+        -d '{\"filename\": \"${name}\"}'") || {
+        log "No saved local slot '${name}' found, starting fresh"
+        return 0
+    }
+    log "Restored: ${result}"
+}
+
 # Determine full state
 get_state() {
     if ! check_gpu_server; then
@@ -104,6 +145,19 @@ get_state() {
     fi
 }
 
+# Determine local server state
+get_local_state() {
+    if ! check_local_server; then
+        echo "local-offline"
+        return
+    fi
+    if check_local_health; then
+        echo "local-running"
+    else
+        echo "local-down"
+    fi
+}
+
 cmd_status() {
     local json_mode=false
     [ "${1:-}" = "--json" ] && json_mode=true
@@ -113,6 +167,7 @@ cmd_status() {
 
     if $json_mode; then
         local slots_json="null" saved_json="[]" gpu_json="null"
+        local local_state local_slots_json="null" local_saved_json="[]"
 
         if [ "$state" = "llama-cpp" ]; then
             slots_json=$(ssh "$LLAMA_HOST" "curl -sf ${LLAMA_URL}/slots" 2>/dev/null) || slots_json="null"
@@ -136,8 +191,16 @@ print(json.dumps(gpus))
 '" 2>/dev/null) || gpu_json="null"
         fi
 
+        # Local server status
+        local_state=$(get_local_state)
+        if [ "$local_state" = "local-running" ]; then
+            local_slots_json=$(ssh "$LOCAL_HOST" "curl -sf ${LOCAL_URL}/slots" 2>/dev/null) || local_slots_json="null"
+            local_saved_json=$(ssh "$LOCAL_HOST" "ls -1 ${LOCAL_SLOT_PATH}/ 2>/dev/null | \
+                python3 -c 'import sys,json; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))'" 2>/dev/null) || local_saved_json="[]"
+        fi
+
         cat <<EOF
-{"state":"${state}","active_backend":"$([ "$state" = "llama-cpp" ] || [ "$state" = "vllm" ] && echo "$state" || echo "none")","slots":${slots_json},"saved_slots":${saved_json},"gpu_memory":${gpu_json}}
+{"state":"${state}","active_backend":"$([ "$state" = "llama-cpp" ] || [ "$state" = "vllm" ] && echo "$state" || echo "none")","slots":${slots_json},"saved_slots":${saved_json},"gpu_memory":${gpu_json},"local":{"state":"${local_state}","slots":${local_slots_json},"saved_slots":${local_saved_json}}}
 EOF
     else
         log "State: ${state}"
@@ -170,6 +233,32 @@ EOF
                 log "No saved slots on disk"
             fi
         fi
+
+        # Show local server status
+        echo ""
+        local local_state
+        local_state=$(get_local_state)
+        case "$local_state" in
+            local-offline)
+                log "Local (CPU): offline"
+                ;;
+            local-running)
+                log "Local (CPU): running"
+                local local_slots
+                local_slots=$(ssh "$LOCAL_HOST" "curl -sf ${LOCAL_URL}/slots" 2>/dev/null | \
+                    python3 -c "import sys,json; s=json.load(sys.stdin); print(f'Slots: {len(s)}, ctx/slot: {s[0][\"n_ctx\"]}')" 2>/dev/null) || true
+                [ -n "$local_slots" ] && log "  $local_slots"
+                local local_saved
+                local_saved=$(ssh "$LOCAL_HOST" "ls -lh ${LOCAL_SLOT_PATH}/ 2>/dev/null" | grep -v ^total || true)
+                if [ -n "$local_saved" ]; then
+                    log "  Saved local slots:"
+                    echo "$local_saved"
+                fi
+                ;;
+            local-down)
+                log "Local (CPU): server reachable but llama-server not running"
+                ;;
+        esac
     fi
 }
 
@@ -271,15 +360,32 @@ case "${1:-help}" in
     restore)
         restore_slot "${2:-$SLOT_NAME}"
         ;;
+    local-save)
+        save_local_slot "${2:-localbot-cpu}"
+        ;;
+    local-restore)
+        restore_local_slot "${2:-localbot-cpu}"
+        ;;
+    local-status)
+        local_state=$(get_local_state)
+        log "Local: ${local_state}"
+        if [ "$local_state" = "local-running" ]; then
+            ssh "$LOCAL_HOST" "curl -sf ${LOCAL_URL}/slots" 2>/dev/null | \
+                python3 -c "import sys,json; s=json.load(sys.stdin); print(f'Slots: {len(s)}, ctx/slot: {s[0][\"n_ctx\"]}')" 2>/dev/null || true
+        fi
+        ;;
     help|--help|-h)
         echo "Usage: wechsler.sh <command> [args]"
         echo ""
         echo "Commands:"
-        echo "  switch <llama-cpp|vllm>  Switch active backend (saves/restores slots)"
-        echo "  status [--json]          Show state, GPU info, saved slots"
-        echo "  stop                     Stop active backend (saves slots first)"
-        echo "  save [name]              Save llama-cpp slot to disk"
-        echo "  restore [name]           Restore llama-cpp slot from disk"
+        echo "  switch <llama-cpp|vllm>  Switch active GPU backend (saves/restores slots)"
+        echo "  status [--json]          Show state, GPU info, local info, saved slots"
+        echo "  stop                     Stop active GPU backend (saves slots first)"
+        echo "  save [name]              Save llama-cpp GPU slot to disk"
+        echo "  restore [name]           Restore llama-cpp GPU slot from disk"
+        echo "  local-save [name]        Save llama-local CPU slot to disk"
+        echo "  local-restore [name]     Restore llama-local CPU slot from disk"
+        echo "  local-status             Show local CPU server status"
         ;;
     *)
         err "Unknown command: $1"

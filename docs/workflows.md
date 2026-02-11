@@ -2,11 +2,18 @@
 
 ## Overview
 
-Wechsler manages a shared GPU server with two inference backends:
+Wechsler manages inference backends across two servers:
+
+### GPU Server (shared, switchable)
 - **llama-cpp** — GGUF models, slot persistence, fast startup (~8s)
 - **vLLM** — HF/AWQ models, LMCache persistence, slow startup (~80s)
+- Only one GPU backend at a time. May be powered off.
 
-Only one backend uses the GPUs at a time. The GPU server may be powered off.
+### Local CPU Server (always-on)
+- **llama-local** — CPU inference on Mini PC (i5-8400T, 32GB RAM)
+- Nemotron-3-Nano-30B-A3B @ ~10 tok/s, 196K context
+- Slot persistence on 2TB NVMe
+- Independent of GPU server — always available as fallback
 
 ## State Model
 
@@ -168,11 +175,59 @@ vllm:      http://vllm:8000/v1 ● (stopped, ~80s to start)
 | Both backends report healthy | Shouldn't happen — report conflict |
 | Backend crashes mid-request | systemd auto-restarts, slot lost until next restore |
 
+## Local CPU Workflows
+
+### 7. Always-On Fallback
+
+**Scenario:** GPU server is off, user sends a message to LocalBot.
+
+```
+1. Agent routes to llama-local (priority 5, always healthy)
+2. Restore pre-warmed slot if available (10ms)
+3. Generate at ~10 tok/s
+4. Save slot on completion
+```
+
+No boot delay. No GPU needed.
+
+### 8. Pre-Warmed Specialized Agents
+
+**Scenario:** Specialized agents (research, routing) with large system prompts.
+
+```
+1. First run: process 5-10K system prompt tokens (~200-500s on CPU)
+2. Save slot: wechsler.sh local-save research-agent
+3. Subsequent runs: restore in 10ms, skip prompt eval entirely
+4. Generate at ~10 tok/s immediately
+```
+
+Slot files are ~50MB each. 2TB NVMe = room for thousands of cached agents.
+
+### 9. Smart Escalation (future)
+
+**Scenario:** Local model decides task needs more compute.
+
+```
+1. Local model receives complex request
+2. Determines it needs GPU-class inference
+3. Triggers GPU server wake (WoL)
+4. Hands off to GPU backend when ready
+```
+
+## Local Server Commands
+
+```bash
+wechsler.sh local-status           # Check local server
+wechsler.sh local-save [name]      # Save CPU slot (default: localbot-cpu)
+wechsler.sh local-restore [name]   # Restore CPU slot
+```
+
 ## Design Principles
 
-1. **One backend at a time** — full GPU resources, no memory contention
-2. **Health-based detection** — no state files to get stale
-3. **Graceful degradation** — save/restore failures don't block switching
-4. **Shared storage for persistence** — `/mnt/models/cache/` on 1TB disk, survives container restarts
-5. **SSH-based remote control** — script runs on management host, reaches backends via SSH hostnames
-6. **Machine-agnostic config** — hosts/ports via env vars, no hardcoded IPs
+1. **One GPU backend at a time** — full GPU resources, no memory contention
+2. **Local CPU always available** — independent of GPU server state
+3. **Health-based detection** — no state files to get stale
+4. **Graceful degradation** — save/restore failures don't block switching
+5. **Dual persistence** — GPU slots on `/mnt/models/cache/`, CPU slots on `/models/cache/slots/`
+6. **SSH-based remote control** — script runs on management host, reaches backends via SSH hostnames
+7. **Machine-agnostic config** — hosts/ports via env vars, no hardcoded IPs
